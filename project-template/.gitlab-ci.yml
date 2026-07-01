@@ -1,0 +1,26 @@
+# 放到【被检查项目】的仓库根目录（不是 SonarQube 主机）。
+# 依赖项目 CI/CD Variables：SONAR_HOST_URL、SONAR_TOKEN（Masked/Protected）。
+stages:
+  - quality
+
+sonarqube-check:
+  stage: quality
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # 缓存目录
+    GIT_DEPTH: "0"                                # 取全历史，保证 New Code / blame 准确
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script:
+    # qualitygate.wait=true：等待质量门结果，门失败则本 job 失败 → 流水线失败 → 阻止合并
+    - sonar-scanner -Dsonar.qualitygate.wait=true
+  allow_failure: false
+  rules:
+    # 在 MR 流水线上跑（分支插件据此做逐 MR 增量分析 + MR 装饰）
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # 在默认分支上跑（建立基线 / New Code 参照）
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

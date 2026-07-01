@@ -1,0 +1,47 @@
+# 本地自包含：SonarQube Community Build（带 community-branch-plugin 26.5.0）+ 本地 PostgreSQL。
+# 插件镜像由 plugins/.../release.Dockerfile 构建：sonarqube-branch:26.5.0（已打包 webapp + jar + javaagent）。
+# 用法：先启动 Docker Desktop 并设好 vm.max_map_count，再 `docker compose -f docker-compose.local.yml up -d`。
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: sonar
+      POSTGRES_DB: sonarqube
+    volumes:
+      - sonar_db:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  sonarqube:
+    image: sonarqube-branch:26.5.0-zh   # SonarQube 26.5 + 分支插件 + 中文包(l10nzh 26.5)
+    depends_on:
+      - db
+    ports:
+      - "9000:9000"
+    environment:
+      SONAR_JDBC_URL: "jdbc:postgresql://db:5432/sonarqube"
+      SONAR_JDBC_USERNAME: "sonar"
+      SONAR_JDBC_PASSWORD: "sonar"
+    volumes:
+      # 注意：不挂 extensions 卷，否则会盖住镜像里打包好的分支插件 jar。
+      - sonar_data:/opt/sonarqube/data
+      - sonar_logs:/opt/sonarqube/logs
+    ulimits:
+      nofile: { soft: 131072, hard: 131072 }
+      nproc:  { soft: 8192,   hard: 8192 }
+    restart: unless-stopped
+
+  # ---- GitLab Runner：用 docker executor 跑 CI，注册到公司 GitLab（github.molardata.com）----
+  # 作用：MR 触发的扫描 job 落到这个本地 runner 上，从而能访问本地 SonarQube。
+  gitlab-runner:
+    image: gitlab/gitlab-runner:latest
+    volumes:
+      - gitlab_runner_config:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+volumes:
+  sonar_db:
+  sonar_data:
+  sonar_logs:
+  gitlab_runner_config:

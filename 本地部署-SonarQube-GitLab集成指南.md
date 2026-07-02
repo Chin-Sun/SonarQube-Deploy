@@ -14,6 +14,7 @@
 - 第 4 章 [项目里加的两个文件：为什么 + 作用](#第-4-章项目里加的两个文件为什么--作用)
 - 第 5 章 [验证清单](#第-5-章验证清单)
 - 第 6 章 [常见坑与 FAQ](#第-6-章常见坑与-faq)
+- 第 7 章 [接入更多项目（以前端为例）](#第-7-章接入更多项目以前端-molar-label-system-fe-v2-为例)
 - 附录 [关键术语表](#附录关键术语表)
 
 > ⚙️ 全文前置认知（先记住）：
@@ -316,6 +317,101 @@ A：MR 装饰是可选功能，需第 3.9 步配置。**没有它也能拦合并
 
 **Q：扫描特别慢？**
 A：纯 Python 项目通常很快；若误把大体量目录纳入 `sonar.sources`，收窄范围即可。前端项目慢多因 JS/TS 桥接内存不足，可加 `-Dsonar.javascript.node.maxspace=4096`。
+
+---
+
+## 第 7 章·接入更多项目（以前端 molar-label-system-fe-v2 为例）
+
+> 本节小目标：把「再挂一个项目进门禁」标准化。复用同一套 SonarQube + Runner，不新建服务。
+
+### 7.1 核心认知：复用，不新建
+
+一套 SonarQube 服务 + 一个 Runner 容器可服务**任意多个项目**。每个项目按 `projectKey` 在 SonarQube 里独立成项。接新项目 = 写 2 个文件 + 配 3 处开关，**不碰 `docker-compose.local.yml`**。
+
+本例约定：SonarQube 项目 key = `daily-molar-label-fe`。
+
+### 7.2 要写的两个文件
+
+**① 项目根 `sonar-project.properties`**（前端示例）：
+
+```properties
+sonar.projectKey=daily-molar-label-fe
+sonar.projectName=daily-molar-label-fe
+sonar.sources=src
+sonar.sourceEncoding=UTF-8
+sonar.exclusions=**/node_modules/**,**/dist/**,**/build/**,**/custom_build/**,**/tools/**,**/*.min.js
+sonar.javascript.node.maxspace=4096   # 前端大项目防 JS/TS 桥接 OOM
+```
+
+**② `.gitlab-ci.yml` 追加 `sonarqube-check` job**（在原有生产流水线基础上加，不覆盖）：
+
+```yaml
+stages:
+  - sonarqube        # 新增
+  # ...原有 stages...
+
+sonarqube-check:
+  stage: sonarqube
+  tags: [local-sonar]
+  image: { name: sonarsource/sonar-scanner-cli:latest, entrypoint: [""] }
+  before_script: []                       # 关键①：覆盖全局 before_script
+  cache:
+    key: "sonar-${CI_PROJECT_ID}"
+    paths: [.sonar/cache]
+  variables: { SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar", GIT_DEPTH: "0", GIT_STRATEGY: fetch }
+  script:
+    - sonar-scanner -Dsonar.qualitygate.wait=true
+  allow_failure: false
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'   # 关键②：只在 MR 跑
+```
+
+> ⚠️ 与 Python 项目模板的两处**必须适配**：
+> - **关键①** `before_script: []`：前端 CI 有全局 `before_script`（`nvm`/clone 构建仓库），不覆盖会污染 scanner 容器导致 job 崩。
+> - **关键②** 只留 `merge_request_event`：前端 `workflow.rules` 屏蔽了 push 触发，`$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` 那条永不命中。
+
+### 7.3 注册 project runner（本例采用）
+
+> runner 三种作用域：instance（管理员，全实例）／ group（组 Owner，整组）／ project（项目 Owner，单项目）。
+> **功能上完全相同，project runner 零损失**；差别只在管理便利——每接一个项目要多注册一次。
+> 本例两个项目跨命名空间（Python 在个人 `Sun-Qian`、前端在 `frontend` 组），group runner 覆盖不了两者，故用 **project runner**。
+
+步骤：
+
+1. 前端项目 → `Settings → CI/CD → Runners → New project runner`，Tags 填 `local-sonar`、不勾 Run untagged，拿 `glrt-` token。
+2. 在**已有的** runner 容器上再注册一个（同容器可挂多个 runner，互不影响）：
+
+   ```bash
+   docker exec sonarqube-deploy-gitlab-runner-1 gitlab-runner register \
+     --non-interactive \
+     --url "https://github.molardata.com" \
+     --token "glrt-<前端项目的 token>" \
+     --executor docker \
+     --docker-image "python:3.11" \
+     --docker-network-mode "sonarqube-deploy_default"
+   docker exec sonarqube-deploy-gitlab-runner-1 gitlab-runner verify   # 核验
+   ```
+
+   > 之后该容器会有两个 project runner（Python + 前端），各服务各的项目。
+
+### 7.4 要配的两处开关（非文件，缺一不可）
+
+| # | 事项 | 关键点 |
+|---|---|---|
+| 1 | **该项目 CI/CD Variables** | 到**前端项目** `Settings → CI/CD → Variables` 加 `SONAR_HOST_URL`(`http://sonarqube:9000`)、`SONAR_TOKEN`；**都不勾 Protect**（否则 MR 分支拿不到），**Mask 仅 TOKEN** |
+| 2 | **拦截开关 + 质量门** | 项目 `Merge requests` 勾 Pipelines must succeed、保护目标分支；SonarQube 里 `daily-molar-label-fe`（首次 MR 扫描自动建）按需绑「只判 New Issues」的自定义门 |
+
+### 7.5 前端项目特有注意
+
+- **扫描慢**：`src` 3600+ 文件，单次约 15–20 分钟，MR 的 `sonarqube-check` 会跑十几分钟。
+- **务必排除** `src/tools/`（含 10 万行生成文件）与 `custom_build/`，否则更慢且指标虚高。
+- **New Code 覆盖率坑**：默认 Sonar way 门含「New Code 覆盖率 ≥ 80%」，前端没接覆盖率会误伤干净 MR；落地初期用只判 New Issues 的自定义门。
+
+### 7.6 验证
+
+- 开一个 MR → 触发 MR 流水线 → `sonarqube-check` 落到**前端 project runner** → 扫 `daily-molar-label-fe` → 门判定。
+- job 日志出现 `Auto detected PULL_REQUEST ... GitlabCiAutoConfigurer` 与 `QUALITY GATE STATUS: ...`。
+- 门 FAIL → 合并被拦；门 PASS → 可合并。
 
 ---
 
